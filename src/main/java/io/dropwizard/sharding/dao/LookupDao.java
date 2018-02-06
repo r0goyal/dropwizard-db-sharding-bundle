@@ -20,6 +20,7 @@ package io.dropwizard.sharding.dao;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import io.dropwizard.hibernate.AbstractDAO;
+import io.dropwizard.sharding.listener.LookupDaoEventListener;
 import io.dropwizard.sharding.sharding.BucketIdExtractor;
 import io.dropwizard.sharding.sharding.LookupKey;
 import io.dropwizard.sharding.sharding.ShardManager;
@@ -57,6 +58,9 @@ public class LookupDao<T> {
     /**
      * This DAO wil be used to perform the ops inside a shard
      */
+
+    private List<LookupDaoEventListener<T>> listeners = Lists.newArrayList();
+
     private final class LookupDaoPriv extends AbstractDAO<T> {
 
         private final SessionFactory sessionFactory;
@@ -160,7 +164,9 @@ public class LookupDao<T> {
      * @throws Exception
      */
     public Optional<T> get(String key) throws Exception {
-        return Optional.ofNullable(get(key, t -> t));
+        Optional<T> entityOptional = Optional.ofNullable(get(key, t -> t));
+        handleEntityFetch(key);
+        return entityOptional;
     }
 
     /**
@@ -176,7 +182,9 @@ public class LookupDao<T> {
     public <U> U get(String key, Function<T, U> handler) throws Exception {
         int shardId = ShardCalculator.shardId(shardManager, bucketIdExtractor, key);
         LookupDaoPriv dao = daos.get(shardId);
-        return Transactions.execute(dao.sessionFactory, true, dao::get, key, handler);
+        U response = Transactions.execute(dao.sessionFactory, true, dao::get, key, handler);
+        handleEntityFetch(key);
+        return response;
     }
 
     /**
@@ -199,7 +207,11 @@ public class LookupDao<T> {
      * @throws Exception
      */
     public Optional<T> save(T entity) throws Exception {
-        return Optional.ofNullable(save(entity, t -> t));
+        Optional<T> entityOptional = Optional.ofNullable(save(entity, t -> t));
+        if (entityOptional.isPresent()) {
+            handleEntitySave(entity);
+        }
+        return entityOptional;
     }
 
     /**
@@ -207,7 +219,8 @@ public class LookupDao<T> {
      * and applies the provided function/lambda to it. The return from the handler becomes the return to the get function.
      * <b>Note:</b> Handler is executed in the same transactional context as the save operation.
      * So any updates made to the object in this context will also get persisted.
-     * @param entity The value of the key field to look for.
+     *
+     * @param entity  The value of the key field to look for.
      * @param handler Handler function/lambda that receives the retrieved object.
      * @return The entity
      * @throws Exception
@@ -217,7 +230,9 @@ public class LookupDao<T> {
         int shardId = ShardCalculator.shardId(shardManager, bucketIdExtractor, key);
         log.debug("Saving entity of type {} with key {} to shard {}", entityClass.getSimpleName(), key, shardId);
         LookupDaoPriv dao = daos.get(shardId);
-        return Transactions.execute(dao.sessionFactory, false, dao::save, entity, handler);
+        U response = Transactions.execute(dao.sessionFactory, false, dao::save, entity, handler);
+        handleEntitySave(entity);
+        return response;
     }
 
     public boolean updateInLock(String id, Function<Optional<T>, T> updater) {
@@ -234,7 +249,7 @@ public class LookupDao<T> {
 
     private boolean updateImpl(String id, Function<String, T> getter, Function<Optional<T>, T> updater, LookupDaoPriv dao) {
         try {
-            return Transactions.<T, String, Boolean>execute(dao.sessionFactory, true, getter, id, entity -> {
+            boolean updated = Transactions.<T, String, Boolean>execute(dao.sessionFactory, true, getter, id, entity -> {
                 T newEntity = updater.apply(Optional.ofNullable(entity));
                 if(null == newEntity) {
                     return false;
@@ -242,6 +257,10 @@ public class LookupDao<T> {
                 dao.update(newEntity);
                 return true;
             });
+            if (updated) {
+                handleEntityUpdate(id);
+            }
+            return updated;
         } catch (Exception e) {
             throw new RuntimeException("Error updating entity: " + id, e);
         }
@@ -304,6 +323,9 @@ public class LookupDao<T> {
         }).flatMap(Collection::stream).collect(Collectors.toList());
     }
 
+    public void registerListener(LookupDaoEventListener<T> listener) {
+        listeners.add(listener);
+    }
 
     protected Field getKeyField() {
         return this.keyField;
@@ -455,5 +477,18 @@ public class LookupDao<T> {
             }
             return result;
         }
+    }
+
+
+    private void handleEntityFetch(String id) {
+        listeners.forEach(x -> x.handleGet(id));
+    }
+
+    private void handleEntitySave(T entity) {
+        listeners.forEach(x -> x.handleSave(entity));
+    }
+
+    private void handleEntityUpdate(String id) {
+        listeners.forEach(x -> x.handleUpdate(id));
     }
 }
